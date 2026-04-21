@@ -1,0 +1,39 @@
+[build-system]
+requires = ["setuptools>=61", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ryzenai-serve"
+version = "0.1.0"
+description = "OpenAI-compatible HTTP server for AMD Ryzen AI NPU LLMs on Linux"
+readme = "README.md"
+authors = [{name = "Andre"}]
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["amd", "ryzen-ai", "npu", "xdna", "llm", "openai-api", "krackan", "strix"]
+classifiers = [
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+]
+dependencies = [
+    "fastapi>=0.110",
+    "uvicorn>=0.27",
+    "pydantic>=2.6",
+    "jinja2>=3.1",
+    "requests>=2.31",
+]
+
+[project.optional-dependencies]
+test = ["pytest>=8.0", "httpx>=0.27"]
+
+[project.scripts]
+ryzenai-serve = "ryzenai_serve.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/buckster123/ryzenai-serve"
+
+[tool.setuptools.packages.find]
+where = ["src"]
