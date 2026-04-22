@@ -37,3 +37,6 @@ Homepage = "https://github.com/buckster123/ryzenai-serve"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+ryzenai_serve = ["static/*"]

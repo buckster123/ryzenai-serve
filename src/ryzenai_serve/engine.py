@@ -72,6 +72,13 @@ class NPUEngine:
             or cfg.get("search", {}).get("max_length", 4096)
         )
 
+        # The NPU compile may have a smaller hard limit than the model's
+        # theoretical context_length (e.g. Gemma-3-4b is compiled for 4K
+        # despite config saying 16K). Read the actual KV-cache limit.
+        decoder_opts = cfg.get("model", {}).get("decoder", {}).get("session_options", {})
+        kv_limit = decoder_opts.get("max_lenght_for_kv_cache")  # AMD's typo, not ours
+        self.max_sequence_length = int(kv_limit or cfg.get("search", {}).get("max_length", self.context_length))
+
         # Detect VLM (multimodal) models: genai_config has a "vision" section.
         # These models feed the decoder via `inputs_embeds` produced by a
         # separate embedding ONNX, so we must drive generation through
@@ -127,7 +134,20 @@ class NPUEngine:
         # Simple fallback: <|role|>content<|end|>
         parts = []
         for m in messages:
-            parts.append(f"<|{m['role']}|>\n{m['content']}\n")
+            content = m.get("content", "")
+            if isinstance(content, list):
+                # Flatten multimodal content for fallback
+                texts = []
+                for item in content:
+                    if isinstance(item, dict):
+                        if item.get("type") == "text":
+                            texts.append(item.get("text", ""))
+                        elif item.get("type") == "image":
+                            texts.append("[image]")
+                    else:
+                        texts.append(str(item))
+                content = " ".join(texts)
+            parts.append(f"<|{m['role']}|>\n{content}\n")
         parts.append("<|assistant|>\n")
         return "".join(parts)
 
@@ -179,21 +199,29 @@ class NPUEngine:
 
     # ---------- generation ----------
 
-    def generate(self, prompt: str, gc: GenerationConfig) -> str:
+    def generate(self, prompt: str, gc: GenerationConfig, images: Optional[list[str]] = None) -> str:
         """Generate full text (non-streaming)."""
-        chunks = list(self.stream(prompt, gc))
+        chunks = list(self.stream(prompt, gc, images=images))
         return "".join(chunks)
 
-    def stream(self, prompt: str, gc: GenerationConfig) -> Iterator[str]:
+    def stream(self, prompt: str, gc: GenerationConfig, images: Optional[list[str]] = None) -> Iterator[str]:
         """Stream decoded token pieces."""
         og = _lazy_import_og()
         with self._lock:
             input_tokens = self.tokenizer.encode(prompt)
             prompt_len = len(input_tokens)
-            max_len = min(
-                self.context_length,
-                prompt_len + max(1, gc.max_tokens),
-            )
+
+            # VLM models: the embedding ONNX is compiled for a fixed max sequence
+            # length (e.g. 4096 for Gemma). Don't shrink max_length based on
+            # prompt size or image requests will overflow and text requests will
+            # underflow the allocated tensors.
+            if self.is_vlm:
+                max_len = self.max_sequence_length
+            else:
+                max_len = min(
+                    self.context_length,
+                    prompt_len + max(1, gc.max_tokens),
+                )
 
             params = og.GeneratorParams(self.model)
             search_opts = {
@@ -211,7 +239,11 @@ class NPUEngine:
             # VLM models take inputs_embeds (from embedding ONNX), not input_ids.
             # Route through MultiModalProcessor with images=None for text-only.
             if self.is_vlm:
-                inputs = self.mm_processor(prompt, images=None)
+                if images:
+                    og_images = og.Images.open(*images)
+                    inputs = self.mm_processor(prompt, images=og_images)
+                else:
+                    inputs = self.mm_processor(prompt, images=None)
                 generator.set_inputs(inputs)
                 decode = self.mm_stream.decode
             else:

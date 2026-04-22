@@ -5,4 +5,4 @@ with a /v1/chat/completions endpoint compatible with OpenAI, LMStudio,
 and llama.cpp server clients.
 """
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

@@ -1,0 +1,374 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>ryzenai-serve chat</title>
+<style>
+  :root {
+    --bg: #0d0d0d;
+    --bg2: #141414;
+    --bg3: #1a1a1a;
+    --fg: #e0e0e0;
+    --fg2: #a0a0a0;
+    --accent: #4ec9b0;
+    --accent2: #ce9178;
+    --border: #2a2a2a;
+    --user: #264f78;
+    --assistant: #1a1a1a;
+    --error: #f44336;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    font-family: 'SF Mono', Monaco, Inconsolata, 'Fira Code', monospace;
+    background: var(--bg);
+    color: var(--fg);
+    display: flex; flex-direction: column;
+  }
+  header {
+    padding: 12px 16px;
+    border-bottom: 1px solid var(--border);
+    background: var(--bg2);
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  header h1 { font-size: 14px; margin: 0; font-weight: 600; color: var(--accent); }
+  header .sub { font-size: 11px; color: var(--fg2); }
+  select, input[type="text"], input[type="number"], button {
+    background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 4px; padding: 4px 8px; font-family: inherit; font-size: 12px;
+  }
+  button { cursor: pointer; transition: border-color .15s; }
+  button:hover { border-color: var(--accent); }
+  button.primary { background: var(--accent); color: #000; border-color: var(--accent); font-weight: 600; }
+  button.primary:hover { filter: brightness(1.1); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  #settings { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  #settings label { font-size: 11px; color: var(--fg2); }
+  #chat { flex: 1; overflow-y: auto; padding: 16px; display: flex; flex-direction: column; gap: 12px; }
+  .msg { max-width: 92%; padding: 10px 14px; border-radius: 8px; line-height: 1.45; font-size: 13px; white-space: pre-wrap; word-wrap: break-word; }
+  .msg.user { align-self: flex-end; background: var(--user); }
+  .msg.assistant { align-self: flex-start; background: var(--assistant); border: 1px solid var(--border); }
+  .msg.system { align-self: center; background: transparent; color: var(--fg2); font-size: 11px; border: 1px dashed var(--border); max-width: 96%; }
+  .msg .role { font-size: 10px; text-transform: uppercase; letter-spacing: .05em; margin-bottom: 4px; opacity: .7; }
+  .msg .actions { margin-top: 6px; display: flex; gap: 6px; }
+  .msg .actions button { font-size: 10px; padding: 2px 6px; }
+  .msg img.thumb { max-height: 120px; max-width: 100%; border-radius: 4px; margin: 4px 0; display: block; }
+  #input-area {
+    padding: 12px 16px;
+    border-top: 1px solid var(--border);
+    background: var(--bg2);
+    display: flex; flex-direction: column; gap: 8px;
+  }
+  #input-row { display: flex; gap: 8px; align-items: flex-end; }
+  #input-area textarea {
+    flex: 1; background: var(--bg3); color: var(--fg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 10px; font-family: inherit; font-size: 13px;
+    resize: none; min-height: 40px; max-height: 200px; line-height: 1.4;
+  }
+  #input-area textarea:focus { outline: none; border-color: var(--accent); }
+  #image-preview { display: flex; gap: 8px; flex-wrap: wrap; }
+  .img-chip { position: relative; display: inline-block; }
+  .img-chip img { height: 60px; border-radius: 4px; border: 1px solid var(--border); }
+  .img-chip .remove { position: absolute; top: -4px; right: -4px; background: var(--error); color: #fff; border: none; border-radius: 50%; width: 16px; height: 16px; font-size: 10px; line-height: 14px; text-align: center; cursor: pointer; padding: 0; }
+  footer {
+    padding: 6px 16px; font-size: 10px; color: var(--fg2); border-top: 1px solid var(--border);
+    display: flex; justify-content: space-between;
+  }
+  .spinner { display: inline-block; width: 10px; height: 10px; border: 2px solid var(--fg2); border-top-color: var(--accent); border-radius: 50%; animation: spin .8s linear infinite; }
+  @keyframes spin { to { transform: rotate(360deg); } }
+  ::-webkit-scrollbar { width: 6px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  ::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
+  input[type="file"] { display: none; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>ryzenai-serve</h1>
+  <span class="sub">chat</span>
+  <div id="settings" style="margin-left:auto;">
+    <label>endpoint
+      <select id="endpoint">
+        <option value="http://127.0.0.1:8000">:8000 Llama-3.2-3B</option>
+        <option value="http://127.0.0.1:8002">:8002 Gemma-3-4B-it</option>
+        <option value="custom">custom...</option>
+      </select>
+    </label>
+    <input type="text" id="customEndpoint" placeholder="http://..." style="display:none;width:160px;">
+    <label>model
+      <input type="text" id="modelId" placeholder="auto" style="width:100px;">
+    </label>
+    <label>temp
+      <input type="number" id="temperature" value="0.7" step="0.1" min="0" max="2" style="width:50px;">
+    </label>
+    <label>top_p
+      <input type="number" id="topP" value="0.95" step="0.05" min="0" max="1" style="width:50px;">
+    </label>
+    <label>max_tok
+      <input type="number" id="maxTokens" value="512" step="64" min="1" style="width:60px;">
+    </label>
+    <button id="sysBtn">system</button>
+    <button id="imgBtn">+img</button>
+    <button id="clearBtn">clear</button>
+  </div>
+</header>
+
+<div id="chat"></div>
+
+<div id="input-area">
+  <div id="image-preview"></div>
+  <div id="input-row">
+    <textarea id="msgInput" rows="1" placeholder="message... (Shift+Enter = newline, Enter = send)"></textarea>
+    <button id="sendBtn" class="primary">send</button>
+  </div>
+</div>
+
+<footer>
+  <span id="status">ready</span>
+  <span id="stats"></span>
+</footer>
+
+<input type="file" id="fileInput" accept="image/*" multiple>
+
+<script>
+const $ = id => document.getElementById(id);
+const chatEl = $('chat');
+const inputEl = $('msgInput');
+const endpointSel = $('endpoint');
+const customEndpoint = $('customEndpoint');
+const statusEl = $('status');
+const statsEl = $('stats');
+const fileInput = $('fileInput');
+const imgPreview = $('image-preview');
+
+let messages = [];
+let systemMessage = '';
+let abortCtrl = null;
+let t0 = 0;
+let attachedImages = []; // {file, dataUrl}
+
+function addMsg(role, content, opts={}) {
+  const div = document.createElement('div');
+  div.className = `msg ${role}`;
+  if (opts.id) div.dataset.id = opts.id;
+  div.innerHTML = `<div class="role">${role}</div><div class="body"></div>`;
+  const body = div.querySelector('.body');
+  if (opts.images && opts.images.length) {
+    opts.images.forEach(url => {
+      const img = document.createElement('img');
+      img.src = url;
+      img.className = 'thumb';
+      body.appendChild(img);
+    });
+  }
+  const textSpan = document.createElement('span');
+  textSpan.textContent = content;
+  body.appendChild(textSpan);
+  if (role === 'assistant' && !opts.streaming) {
+    const actions = document.createElement('div');
+    actions.className = 'actions';
+    actions.innerHTML = `<button onclick="copyMsg(this)">copy</button><button onclick="retryMsg(this)">retry</button>`;
+    div.appendChild(actions);
+  }
+  chatEl.appendChild(div);
+  chatEl.scrollTop = chatEl.scrollHeight;
+  return div;
+}
+
+function updateMsg(div, text) {
+  const body = div.querySelector('.body');
+  // Keep images, update text span (last child)
+  const span = body.querySelector('span:last-child');
+  if (span) span.textContent = text;
+  else {
+    const s = document.createElement('span');
+    s.textContent = text;
+    body.appendChild(s);
+  }
+  chatEl.scrollTop = chatEl.scrollHeight;
+}
+
+function copyMsg(btn) {
+  const text = btn.closest('.msg').querySelector('.body span:last-child').textContent;
+  navigator.clipboard.writeText(text);
+  btn.textContent = 'copied';
+  setTimeout(() => btn.textContent = 'copy', 1200);
+}
+
+function retryMsg(btn) {
+  const idx = Array.from(chatEl.children).indexOf(btn.closest('.msg'));
+  if (idx < 1) return;
+  const userDiv = chatEl.children[idx-1];
+  const text = userDiv.querySelector('.body span:last-child').textContent;
+  chatEl.children[idx].remove();
+  userDiv.remove();
+  messages = messages.slice(0, messages.length - 2);
+  send(text);
+}
+
+function getEndpoint() {
+  return endpointSel.value === 'custom' ? customEndpoint.value.trim() : endpointSel.value;
+}
+
+function renderImagePreviews() {
+  imgPreview.innerHTML = '';
+  attachedImages.forEach((img, i) => {
+    const chip = document.createElement('div');
+    chip.className = 'img-chip';
+    chip.innerHTML = `<img src="${img.dataUrl}"><button class="remove" onclick="removeImage(${i})">×</button>`;
+    imgPreview.appendChild(chip);
+  });
+}
+window.removeImage = (idx) => {
+  attachedImages.splice(idx, 1);
+  renderImagePreviews();
+};
+
+async function send(text) {
+  if (!text.trim() && !attachedImages.length) return;
+  if (abortCtrl) return;
+
+  const endpoint = getEndpoint();
+  if (!endpoint) { alert('pick an endpoint'); return; }
+
+  // Build message content
+  let msgContent;
+  const imageUrls = attachedImages.map(img => img.dataUrl);
+  if (attachedImages.length) {
+    msgContent = [{type:'text', text: text || ''}];
+    imageUrls.forEach(url => msgContent.push({type:'image_url', image_url:{url}}));
+  } else {
+    msgContent = text;
+  }
+
+  messages.push({role:'user', content: msgContent});
+  addMsg('user', text || '', {images: imageUrls});
+  inputEl.value = '';
+  inputEl.rows = 1;
+  attachedImages = [];
+  renderImagePreviews();
+
+  const reqBody = {
+    messages: systemMessage ? [{role:'system',content:systemMessage}, ...messages] : messages,
+    stream: true,
+    max_tokens: +$('maxTokens').value,
+    temperature: +$('temperature').value,
+    top_p: +$('topP').value,
+  };
+  const modelId = $('modelId').value.trim();
+  if (modelId) reqBody.model = modelId;
+
+  abortCtrl = new AbortController();
+  statusEl.innerHTML = '<span class="spinner"></span> generating...';
+  t0 = performance.now();
+  let assistantDiv = null;
+  let fullText = '';
+
+  try {
+    const resp = await fetch(`${endpoint}/v1/chat/completions`, {
+      method: 'POST',
+      headers: {'Content-Type':'application/json'},
+      body: JSON.stringify(reqBody),
+      signal: abortCtrl.signal,
+    });
+    if (!resp.ok) {
+      const err = await resp.text();
+      throw new Error(`HTTP ${resp.status}: ${err}`);
+    }
+    const reader = resp.body.getReader();
+    const decoder = new TextDecoder();
+    let buf = '';
+    assistantDiv = addMsg('assistant', '', {streaming:true, id:'stream'});
+
+    while (true) {
+      const {done, value} = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, {stream:true});
+      const lines = buf.split('\n');
+      buf = lines.pop();
+      for (const line of lines) {
+        if (!line.startsWith('data: ')) continue;
+        const data = line.slice(6);
+        if (data === '[DONE]') continue;
+        try {
+          const json = JSON.parse(data);
+          const delta = json.choices?.[0]?.delta?.content;
+          if (delta) { fullText += delta; updateMsg(assistantDiv, fullText); }
+        } catch(e) {}
+      }
+    }
+  } catch (e) {
+    if (e.name === 'AbortError') {
+      statusEl.textContent = 'cancelled';
+    } else {
+      addMsg('system', `Error: ${e.message}`);
+      statusEl.textContent = 'error';
+    }
+    if (assistantDiv) assistantDiv.remove();
+    abortCtrl = null;
+    return;
+  }
+
+  abortCtrl = null;
+  messages.push({role:'assistant', content:fullText});
+  assistantDiv.removeAttribute('data-id');
+  const actions = document.createElement('div');
+  actions.className = 'actions';
+  actions.innerHTML = `<button onclick="copyMsg(this)">copy</button><button onclick="retryMsg(this)">retry</button>`;
+  assistantDiv.appendChild(actions);
+
+  const elapsed = (performance.now() - t0) / 1000;
+  const tokPerSec = (fullText.length / 4 / elapsed).toFixed(1);
+  statusEl.textContent = 'ready';
+  statsEl.textContent = `${elapsed.toFixed(1)}s ~${tokPerSec} tok/s est | ${messages.length} msgs`;
+}
+
+$('sendBtn').onclick = () => send(inputEl.value);
+inputEl.addEventListener('keydown', e => {
+  if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); send(inputEl.value); }
+});
+inputEl.addEventListener('input', () => {
+  inputEl.rows = Math.min(10, Math.max(1, inputEl.value.split('\n').length));
+});
+
+endpointSel.onchange = () => {
+  customEndpoint.style.display = endpointSel.value === 'custom' ? 'inline-block' : 'none';
+};
+
+$('clearBtn').onclick = () => {
+  if (!confirm('clear conversation?')) return;
+  messages = [];
+  chatEl.innerHTML = '';
+  statsEl.textContent = '';
+  attachedImages = [];
+  renderImagePreviews();
+};
+
+$('sysBtn').onclick = () => {
+  const val = prompt('System prompt:', systemMessage);
+  if (val !== null) {
+    systemMessage = val;
+    addMsg('system', `system prompt set: ${systemMessage || '(empty)'}`);
+  }
+};
+
+$('imgBtn').onclick = () => fileInput.click();
+
+fileInput.onchange = () => {
+  for (const file of fileInput.files) {
+    const reader = new FileReader();
+    reader.onload = e => {
+      attachedImages.push({file, dataUrl: e.target.result});
+      renderImagePreviews();
+    };
+    reader.readAsDataURL(file);
+  }
+  fileInput.value = '';
+};
+
+inputEl.focus();
+</script>
+</body>
+</html>
