@@ -72,10 +72,23 @@ class NPUEngine:
             or cfg.get("search", {}).get("max_length", 4096)
         )
 
+        # Detect VLM (multimodal) models: genai_config has a "vision" section.
+        # These models feed the decoder via `inputs_embeds` produced by a
+        # separate embedding ONNX, so we must drive generation through
+        # MultiModalProcessor (with images=None for text-only requests)
+        # rather than tokenizer.encode + generator.append_tokens.
+        self.is_vlm = "vision" in cfg.get("model", {})
+
         t0 = time.time()
         self.model = og.Model(self.model_dir)
         self.tokenizer = og.Tokenizer(self.model)
         self.tokenizer_stream = self.tokenizer.create_stream()
+        if self.is_vlm:
+            self.mm_processor = self.model.create_multimodal_processor()
+            self.mm_stream = self.mm_processor.create_stream()
+        else:
+            self.mm_processor = None
+            self.mm_stream = None
         init_s = time.time() - t0
 
         self._lock = threading.Lock()
@@ -98,8 +111,16 @@ class NPUEngine:
             try:
                 import jinja2
                 env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True)
+                # Some templates call raise_exception (e.g. Gemma) — no-op it
+                # since our callers pre-validate message roles.
+                env.globals["raise_exception"] = lambda msg: ""
                 template = env.from_string(tmpl)
-                return template.render(messages=messages, add_generation_prompt=True)
+                return template.render(
+                    messages=messages,
+                    add_generation_prompt=True,
+                    bos_token=self._special_tokens_cached().get("bos_token", ""),
+                    eos_token=self._special_tokens_cached().get("eos_token", ""),
+                )
             except Exception:
                 pass  # fall through to simple fallback
 
@@ -112,6 +133,28 @@ class NPUEngine:
 
     _chat_template = None
     _chat_template_loaded = False
+    _special_tokens: Optional[dict] = None
+
+    def _special_tokens_cached(self) -> dict:
+        if self._special_tokens is not None:
+            return self._special_tokens
+        st: dict = {}
+        for fn in ("tokenizer_config.json", "special_tokens_map.json"):
+            f = Path(self.model_dir) / fn
+            if not f.exists():
+                continue
+            try:
+                d = json.loads(f.read_text())
+            except Exception:
+                continue
+            for key in ("bos_token", "eos_token", "pad_token", "unk_token"):
+                v = d.get(key)
+                if isinstance(v, dict):
+                    v = v.get("content")
+                if isinstance(v, str) and key not in st:
+                    st[key] = v
+        self._special_tokens = st
+        return st
 
     def _chat_template_cached(self) -> Optional[str]:
         if self._chat_template_loaded:
@@ -164,14 +207,23 @@ class NPUEngine:
             params.set_search_options(**search_opts)
 
             generator = og.Generator(self.model, params)
-            generator.append_tokens(input_tokens)
+
+            # VLM models take inputs_embeds (from embedding ONNX), not input_ids.
+            # Route through MultiModalProcessor with images=None for text-only.
+            if self.is_vlm:
+                inputs = self.mm_processor(prompt, images=None)
+                generator.set_inputs(inputs)
+                decode = self.mm_stream.decode
+            else:
+                generator.append_tokens(input_tokens)
+                decode = self.tokenizer_stream.decode
 
             completion_tokens = 0
             try:
                 while not generator.is_done():
                     generator.generate_next_token()
                     new_token = generator.get_next_tokens()[0]
-                    piece = self.tokenizer_stream.decode(new_token)
+                    piece = decode(new_token)
                     if piece:
                         yield piece
                     completion_tokens += 1
