@@ -1,21 +1,22 @@
-"""OpenAI-compatible FastAPI app."""
+"""OpenAI-compatible FastAPI app — chat + embeddings."""
 
 from __future__ import annotations
 
 import json
 import time
 import uuid
-from typing import List, Optional
+from typing import List, Optional, Union
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 
 from ryzenai_serve import __version__
 from ryzenai_serve.engine import GenerationConfig, NPUEngine
+from ryzenai_serve.embedder import EmbeddingEngine
 
 
-# ---------- Pydantic models (OpenAI-shape subset) ----------
+# ---------- Pydantic models ----------
 
 class ChatMessage(BaseModel):
     role: str
@@ -23,7 +24,7 @@ class ChatMessage(BaseModel):
 
 
 class ChatRequest(BaseModel):
-    model: Optional[str] = None          # ignored; server loads a single model
+    model: Optional[str] = None
     messages: List[ChatMessage]
     max_tokens: Optional[int] = 512
     temperature: Optional[float] = 0.7
@@ -60,9 +61,39 @@ class ChatResponse(BaseModel):
     usage: Usage
 
 
+class EmbeddingsRequest(BaseModel):
+    input: Union[str, List[str]]
+    model: Optional[str] = None
+    encoding_format: Optional[str] = "float"   # "float" only; "base64" not supported
+
+
+class EmbeddingData(BaseModel):
+    object: str = "embedding"
+    index: int
+    embedding: List[float]
+
+
+class EmbeddingsUsage(BaseModel):
+    prompt_tokens: int = 0
+    total_tokens: int = 0
+
+
+class EmbeddingsResponse(BaseModel):
+    object: str = "list"
+    data: List[EmbeddingData]
+    model: str
+    usage: EmbeddingsUsage
+
+
 # ---------- App factory ----------
 
-def create_app(engine: NPUEngine) -> FastAPI:
+def create_app(
+    engine: Optional[NPUEngine] = None,
+    embedder: Optional[EmbeddingEngine] = None,
+) -> FastAPI:
+    if engine is None and embedder is None:
+        raise ValueError("create_app needs at least one of engine/embedder")
+
     app = FastAPI(title="ryzenai-serve", version=__version__)
 
     @app.get("/")
@@ -70,39 +101,59 @@ def create_app(engine: NPUEngine) -> FastAPI:
         return {
             "server": "ryzenai-serve",
             "version": __version__,
-            "model": engine.model_id,
-            "context_length": engine.context_length,
+            "chat_model": engine.model_id if engine else None,
+            "embedding_model": embedder.model_id if embedder else None,
+            "context_length": engine.context_length if engine else None,
+            "embedding_dim": embedder.dim if embedder else None,
         }
 
     @app.get("/v1/models")
     def list_models():
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": engine.model_id,
-                    "object": "model",
-                    "created": int(time.time()),
-                    "owned_by": "ryzenai-serve",
-                }
-            ],
-        }
+        items = []
+        now = int(time.time())
+        if engine:
+            items.append({"id": engine.model_id, "object": "model",
+                          "created": now, "owned_by": "ryzenai-serve",
+                          "capabilities": ["chat.completions"]})
+        if embedder:
+            items.append({"id": embedder.model_id, "object": "model",
+                          "created": now, "owned_by": "ryzenai-serve",
+                          "capabilities": ["embeddings"],
+                          "dim": embedder.dim})
+        return {"object": "list", "data": items}
 
     @app.get("/stats")
     def stats():
-        s = engine.stats
-        return {
-            "model": s.model_id,
-            "model_path": s.model_path,
-            "context_length": s.context_length,
-            "init_seconds": s.init_seconds,
-            "requests": s.requests,
-            "prompt_tokens": s.prompt_tokens,
-            "completion_tokens": s.completion_tokens,
-        }
+        out = {}
+        if engine:
+            s = engine.stats
+            out["chat"] = {
+                "model": s.model_id,
+                "model_path": s.model_path,
+                "context_length": s.context_length,
+                "init_seconds": s.init_seconds,
+                "requests": s.requests,
+                "prompt_tokens": s.prompt_tokens,
+                "completion_tokens": s.completion_tokens,
+            }
+        if embedder:
+            es = embedder.stats
+            out["embeddings"] = {
+                "model": es.model_id,
+                "model_path": es.model_path,
+                "dim": es.dim,
+                "init_seconds": es.init_seconds,
+                "requests": es.requests,
+                "input_tokens": es.input_tokens,
+            }
+        return out
+
+    # ---------- Chat ----------
 
     @app.post("/v1/chat/completions")
     def chat_completions(req: ChatRequest):
+        if engine is None:
+            raise HTTPException(status_code=501, detail="No chat model loaded on this server")
         prompt = engine.render_chat([m.model_dump() for m in req.messages])
 
         gc = GenerationConfig(
@@ -120,7 +171,6 @@ def create_app(engine: NPUEngine) -> FastAPI:
                 media_type="text/event-stream",
             )
 
-        # Non-streaming: collect all
         text_parts: list[str] = []
         stop_hit = False
         for piece in engine.stream(prompt, gc):
@@ -153,12 +203,37 @@ def create_app(engine: NPUEngine) -> FastAPI:
             ),
         )
 
+    # ---------- Embeddings ----------
+
+    @app.post("/v1/embeddings")
+    def embeddings(req: EmbeddingsRequest):
+        if embedder is None:
+            raise HTTPException(status_code=501, detail="No embedding model loaded on this server")
+        if req.encoding_format not in (None, "float"):
+            raise HTTPException(status_code=400, detail=f"encoding_format={req.encoding_format!r} not supported; use 'float'")
+
+        inputs = [req.input] if isinstance(req.input, str) else list(req.input)
+        if not inputs:
+            raise HTTPException(status_code=400, detail="'input' is empty")
+
+        vecs = embedder.embed(inputs)
+        data = [
+            EmbeddingData(index=i, embedding=v.tolist())
+            for i, v in enumerate(vecs)
+        ]
+        # rough token accounting
+        tok_count = sum(len(embedder.tokenizer.encode(t)) for t in inputs)
+        return EmbeddingsResponse(
+            data=data,
+            model=embedder.model_id,
+            usage=EmbeddingsUsage(prompt_tokens=tok_count, total_tokens=tok_count),
+        )
+
     return app
 
 
 def _stream_chat(engine: NPUEngine, prompt: str, gc: GenerationConfig,
                  stop: List[str], model_id: str):
-    """SSE generator for streaming chat completions."""
     cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
 
@@ -176,7 +251,6 @@ def _stream_chat(engine: NPUEngine, prompt: str, gc: GenerationConfig,
         }
         return f"data: {json.dumps(obj)}\n\n"
 
-    # Role preamble
     yield frame({"role": "assistant"})
 
     buf = ""
@@ -187,9 +261,8 @@ def _stream_chat(engine: NPUEngine, prompt: str, gc: GenerationConfig,
             if stop:
                 for s in stop:
                     if s and s in buf:
-                        # trim and flush remaining before stop token
                         tail = buf.split(s)[0]
-                        new = tail[len(buf) - len(piece):]  # approx
+                        new = tail[len(buf) - len(piece):]
                         if new:
                             yield frame({"content": new})
                         stop_hit = True

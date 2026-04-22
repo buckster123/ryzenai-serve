@@ -1,24 +1,25 @@
 # ryzenai-serve
 
-OpenAI-compatible HTTP server for AMD Ryzen AI NPU LLMs on Linux.
+OpenAI-compatible HTTP server for AMD Ryzen AI on Linux — NPU LLMs (`/v1/chat/completions`) and CPU/NPU sentence embeddings (`/v1/embeddings`).
 
-Wraps `onnxruntime-genai` so pre-quantized NPU models from the `amd/ryzen-ai-171-npu-{4K,16K}` HuggingFace collections can be served behind `/v1/chat/completions` — making them a drop-in backend for LMStudio/Ollama/OpenAI-compatible clients, LangChain, CerebroCortex's Dream Engine, and anything else that speaks the OpenAI API.
+Wraps `onnxruntime-genai` for the chat side so pre-quantized NPU models from the `amd/ryzen-ai-171-npu-{4K,16K}` HuggingFace collections are servable behind OpenAI-shaped endpoints. Wraps stock `onnxruntime` for the embeddings side so any HF `sentence-transformers` ONNX (BGE, MiniLM, etc., INT8 or FP32) works as a drop-in vector store backend. A single binary can run either or both engines concurrently — making it a drop-in backend for LMStudio/Ollama-compatible clients, LangChain, CerebroCortex's Dream Engine, and anything else that speaks the OpenAI API.
 
 ## Status
 
-`0.1.0` — single-model serve, chat completions (sync + streaming), `/v1/models`, `/stats`. Tested against Llama-3.2-3B, Phi-4-mini, Qwen2.5-{3B,7B} NPU-16K on Krackan Point (Ryzen AI 5 340).
+`0.2.0` — adds `/v1/embeddings` with pluggable ORT-backend sentence embedders. `0.1.x` bits still supported: single LLM serve, chat completions sync + streaming, `/v1/models`, `/stats`. Tested against Llama-3.2-3B, Phi-4-mini NPU-16K on Krackan Point (Ryzen AI 5 340) and BAAI/bge-small-en-v1.5 INT8 on CPU.
 
 ## Requirements
 
-- Linux with AMD Ryzen AI SDK 1.7.1+ installed (see `mlops/amd-xdna-linux` skill)
-- XDNA NPU (Krackan / Strix / Strix Halo)
+- Linux with AMD Ryzen AI SDK 1.7.1+ installed for NPU use (see `mlops/amd-xdna-linux` skill). Not required for embeddings-only.
+- XDNA NPU (Krackan / Strix / Strix Halo) for NPU use
 - Python 3.10+
-- An OGA-packaged NPU model (any directory containing `genai_config.json`)
+- For chat: an OGA-packaged NPU model (directory containing `genai_config.json`)
+- For embeddings: an ONNX sentence-embedding model dir with tokenizer files (HF `sentence-transformers` layout works as-is)
 
 ## Install
 
 ```bash
-# Inside the Ryzen AI venv (so onnxruntime_genai is available)
+# Inside the Ryzen AI venv (so onnxruntime_genai is available for NPU LLM)
 source ~/run_llm/env.sh
 export LD_LIBRARY_PATH="/opt/xilinx/xrt/lib:$LD_LIBRARY_PATH"
 
@@ -27,59 +28,106 @@ pip install -e .
 
 ## Run
 
+Three modes — launch chat only, embeddings only, or both:
+
 ```bash
+# chat only (NPU)
 ryzenai-serve \
   --model-dir ~/run_llm/Llama-3.2-3B-Instruct_rai_1.7.1_npu_16K \
   --host 127.0.0.1 --port 8000
+
+# embeddings only (CPU)
+ryzenai-serve \
+  --embedder-dir ~/run_llm/bge-small-en-v1.5-int8 \
+  --embedder-pool cls \
+  --host 127.0.0.1 --port 8001
+
+# both, one process
+ryzenai-serve \
+  --model-dir ~/run_llm/Llama-3.2-3B-Instruct_rai_1.7.1_npu_16K \
+  --embedder-dir ~/run_llm/bge-small-en-v1.5-int8 \
+  --host 127.0.0.1 --port 8000
 ```
+
+Recommended production layout: two processes on ports 8000/8001 so you can restart them independently and avoid serializing NPU vs CPU work behind one uvicorn worker.
 
 ## Test
 
 ```bash
-# Non-streaming
+# Chat — non-streaming
 curl -s localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Why is the sky blue?"}],"max_tokens":100}' \
   | jq .
 
-# Streaming
+# Chat — streaming (SSE)
 curl -N localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{"messages":[{"role":"user","content":"Tell me a joke."}],"stream":true,"max_tokens":80}'
 
+# Embeddings
+curl -s localhost:8001/v1/embeddings \
+  -H "Content-Type: application/json" \
+  -d '{"input":["The NPU is fast.","Memory consolidation happens in REM."]}' \
+  | jq '.data[0].embedding | length'   # -> 384
+
 # Model listing
-curl -s localhost:8000/v1/models | jq .
+curl -s localhost:8001/v1/models | jq .
 
 # Stats
 curl -s localhost:8000/stats | jq .
+curl -s localhost:8001/stats | jq .
 ```
 
 ## Use with CerebroCortex
 
-In CerebroCortex's config (`src/cerebro/config.py` or env overrides):
-
-```python
-LLM_PRIMARY_PROVIDER = "openai_compat"
-LLM_PRIMARY_MODEL = "Llama-3.2-3B-Instruct_rai_1.7.1_npu_16K"   # any string; server ignores
-OPENAI_COMPAT_BASE_URL = "http://localhost:8000"
+```json
+{
+  "llm": {
+    "primary_provider": "openai_compat",
+    "primary_model": "Llama-3.2-3B-Instruct-npu-16K",
+    "openai_compat_base_url": "http://127.0.0.1:8000",
+    "openai_compat_embedding_base_url": "http://127.0.0.1:8001",
+    "openai_compat_embedding_model": "bge-small-en-v1.5-int8"
+  }
+}
 ```
 
-Then `./cerebro dream --run` routes all Dream Engine LLM calls through the NPU — offline overnight consolidation at ~15W sustained.
+`./cerebro dream run` routes LLM calls through the NPU and embedding calls through the CPU INT8 BGE — full local stack, ~15W sustained. Dream cycle on 14-memory corpus: ~83s, 9 LLM calls + ~20 embedding batches. See the `mlops/cerebro-npu-backend` skill for the full runbook including corpus-migration scripts.
+
+## Building an INT8 embedder
+
+Stock `onnxruntime.quantization.quantize_dynamic` (no custom ops — avoids Quark's libcustom_ops ABI drift on SDK 1.7.1):
+
+```python
+from onnxruntime.quantization import quantize_dynamic, QuantType
+quantize_dynamic(
+    model_input="bge-small-en-v1.5/onnx/model.onnx",
+    model_output="bge-small-en-v1.5-int8/model.onnx",
+    weight_type=QuantType.QInt8,
+    per_channel=True,
+    op_types_to_quantize=["MatMul", "Gemm"],
+)
+```
+
+Copy the tokenizer files (`tokenizer.json`, `tokenizer_config.json`, `vocab.txt`, `special_tokens_map.json`, `config.json`, `modules.json`, `config_sentence_transformers.json`, `sentence_bert_config.json`) next to `model.onnx`. Result: ~2x faster, ~50% smaller, cosine-vs-FP32 ≥ 0.996.
 
 ## Design notes
 
-- **Single model, load-at-startup**. NPU init is ~4-7s and peak RAM is the model size; swapping isn't cheap enough for multi-model hosting on 24GB systems. Use multiple ports if you need multiple models.
-- **Generation is serialized** under a threading lock — the NPU runs one sequence at a time.
+- **Pluggable embedding backend** — `EmbeddingEngine` accepts any ORT provider list. Today it defaults to `CPUExecutionProvider`; when BGE-on-VitisAI-EP unblocks (tracking onnxruntime pinning + non-Quark quant paths), the same class will swap providers without any HTTP changes.
+- **Single model per role, load-at-startup**. NPU init is ~4-7s and peak RAM is the model size; swapping isn't cheap enough for multi-model hosting on 24GB systems. Use multiple ports if you need multiple models.
+- **Generation is serialized** under a threading lock — the NPU runs one sequence at a time. Embeddings also serialize (ORT session isn't thread-safe in general).
 - **Chat templating** uses the model's `chat_template` from `tokenizer_config.json` via jinja2, so AMD-shipped models work without per-model configuration.
-- **Streaming is SSE** (standard OpenAI format).
-- **`/v1/embeddings` is not implemented yet** — planned for when BGE-on-NPU is wired up (see `amd-xdna-linux` skill, Phase 3).
+- **Pooling** — `--embedder-pool cls` (BGE/BERT default) or `--embedder-pool mean` (MiniLM/SBERT). L2-normalized output in all cases.
 
 ## Known limits
 
-- No batching (NPU single-session).
+- No batching on chat (NPU single-session).
 - No function-calling / tool use (pass-through only).
 - No `/v1/completions` (legacy endpoint — use chat completions).
+- Embeddings `encoding_format: "base64"` not yet supported; use `"float"`.
 - `stop` strings are detokenized post-hoc; very long stop strings may overshoot by a few tokens.
+- BGE-on-NPU via Vitis AI EP is blocked as of SDK 1.7.1 (Quark libcustom_ops ABI drift, see `mlops/cerebro-npu-backend` skill). CPU-INT8 is the shipping default.
 
 ## License
 

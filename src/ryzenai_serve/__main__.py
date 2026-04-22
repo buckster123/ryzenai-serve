@@ -1,4 +1,10 @@
-"""CLI entry point: `ryzenai-serve --model-dir PATH [--host 0.0.0.0 --port 8000]`"""
+"""CLI entry point for ryzenai-serve.
+
+Supports three startup modes:
+  • chat only:        --model-dir PATH
+  • embeddings only:  --embedder-dir PATH
+  • both:             --model-dir PATH --embedder-dir PATH
+"""
 
 from __future__ import annotations
 
@@ -9,13 +15,25 @@ import sys
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="ryzenai-serve",
-        description="OpenAI-compatible HTTP server for AMD Ryzen AI NPU LLMs.",
+        description="OpenAI-compatible HTTP server for AMD Ryzen AI (NPU LLMs + CPU/NPU embeddings).",
     )
-    parser.add_argument("--model-dir", required=False,
-                        help="Path to OGA model directory (contains genai_config.json). "
-                             "E.g. ~/run_llm/Llama-3.2-3B-Instruct_rai_1.7.1_npu_16K")
+    parser.add_argument("--model-dir", default=None,
+                        help="Path to OGA LLM model directory (contains genai_config.json). "
+                             "Enables /v1/chat/completions.")
     parser.add_argument("--model-id", default=None,
-                        help="Model ID reported to clients. Defaults to dir basename.")
+                        help="LLM model id reported to clients. Defaults to dir basename.")
+    parser.add_argument("--embedder-dir", default=None,
+                        help="Path to ONNX sentence-embedding model directory (with tokenizer files). "
+                             "Enables /v1/embeddings.")
+    parser.add_argument("--embedder-id", default=None,
+                        help="Embedding model id reported to clients. Defaults to dir basename.")
+    parser.add_argument("--embedder-onnx", default="model.onnx",
+                        help="Relative ONNX filename inside --embedder-dir (default: model.onnx; "
+                             "'onnx/model.onnx' auto-fallback).")
+    parser.add_argument("--embedder-pool", default="cls", choices=["cls", "mean"],
+                        help="Pooling: 'cls' for BGE/BERT, 'mean' for MiniLM/SBERT (default: cls).")
+    parser.add_argument("--embedder-max-length", type=int, default=512,
+                        help="Max tokenizer length for embedder (default: 512).")
     parser.add_argument("--host", default="127.0.0.1")
     parser.add_argument("--port", type=int, default=8000)
     parser.add_argument("--log-level", default="info",
@@ -28,28 +46,45 @@ def main(argv: list[str] | None = None) -> int:
         print(__version__)
         return 0
 
-    if not args.model_dir:
-        parser.error("--model-dir is required")
+    if not args.model_dir and not args.embedder_dir:
+        parser.error("at least one of --model-dir or --embedder-dir is required")
 
-    # Environment sanity — AMD venv + XRT must be sourced
     import os
-    if not os.environ.get("RYZEN_AI_INSTALLATION_PATH"):
+    if args.model_dir and not os.environ.get("RYZEN_AI_INSTALLATION_PATH"):
         print("WARNING: RYZEN_AI_INSTALLATION_PATH not set. "
               "Did you `source ~/run_llm/env.sh` first?", file=sys.stderr)
-    if "/opt/xilinx/xrt/lib" not in os.environ.get("LD_LIBRARY_PATH", ""):
+    if args.model_dir and "/opt/xilinx/xrt/lib" not in os.environ.get("LD_LIBRARY_PATH", ""):
         print("WARNING: /opt/xilinx/xrt/lib not in LD_LIBRARY_PATH. "
               "libxrt_coreutil.so may fail to load.", file=sys.stderr)
 
-    print(f"[ryzenai-serve] loading model: {args.model_dir}", file=sys.stderr)
-    from ryzenai_serve.engine import NPUEngine
-    engine = NPUEngine(args.model_dir, model_id=args.model_id)
-    print(f"[ryzenai-serve] ready: model={engine.model_id} "
-          f"ctx={engine.context_length} init={engine.stats.init_seconds}s",
-          file=sys.stderr)
+    engine = None
+    embedder = None
+
+    if args.model_dir:
+        print(f"[ryzenai-serve] loading LLM: {args.model_dir}", file=sys.stderr)
+        from ryzenai_serve.engine import NPUEngine
+        engine = NPUEngine(args.model_dir, model_id=args.model_id)
+        print(f"[ryzenai-serve] LLM ready: model={engine.model_id} "
+              f"ctx={engine.context_length} init={engine.stats.init_seconds}s",
+              file=sys.stderr)
+
+    if args.embedder_dir:
+        print(f"[ryzenai-serve] loading embedder: {args.embedder_dir}", file=sys.stderr)
+        from ryzenai_serve.embedder import EmbeddingEngine
+        embedder = EmbeddingEngine(
+            args.embedder_dir,
+            onnx_subpath=args.embedder_onnx,
+            model_id=args.embedder_id,
+            pool=args.embedder_pool,
+            max_length=args.embedder_max_length,
+        )
+        print(f"[ryzenai-serve] embedder ready: model={embedder.model_id} "
+              f"dim={embedder.dim} init={embedder.stats.init_seconds}s",
+              file=sys.stderr)
 
     import uvicorn
     from ryzenai_serve.server import create_app
-    app = create_app(engine)
+    app = create_app(engine=engine, embedder=embedder)
     uvicorn.run(app, host=args.host, port=args.port, log_level=args.log_level)
     return 0
 
