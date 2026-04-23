@@ -181,7 +181,7 @@ def _fetch_image_to_temp(url: str) -> str:
             os.write(fd, data)
         finally:
             os.close(fd)
-        return path
+        return _resize_image_if_needed(path)
 
     if url.startswith("http://") or url.startswith("https://"):
         fd, path = tempfile.mkstemp(suffix=".bin")
@@ -207,13 +207,36 @@ def _fetch_image_to_temp(url: str) -> str:
             new_path = path.replace(".bin", ext)
             os.rename(path, new_path)
             path = new_path
-        return path
+        return _resize_image_if_needed(path)
 
     # Local file path (relative or absolute)
     p = Path(url).expanduser().resolve()
     if not p.exists():
         raise HTTPException(status_code=400, detail=f"Image not found: {url}")
-    return str(p)
+    return _resize_image_if_needed(str(p))
+
+
+def _resize_image_if_needed(path: str, max_dim: int = 1024) -> str:
+    """Resize image if any dimension exceeds max_dim. Returns (possibly new) path."""
+    try:
+        from PIL import Image
+    except ImportError:
+        return path
+    try:
+        with Image.open(path) as img:
+            w, h = img.size
+            if w <= max_dim and h <= max_dim:
+                return path
+            # Calculate new size preserving aspect ratio
+            ratio = min(max_dim / w, max_dim / h)
+            new_size = (int(w * ratio), int(h * ratio))
+            resized = img.resize(new_size, Image.LANCZOS)
+            # Save to same path (overwrite) — og.Images.open just needs the file
+            resized.save(path, format=img.format or "JPEG")
+    except Exception:
+        # If PIL fails to process, return original path and let og.Images.open handle it
+        pass
+    return path
 
 
 def _transform_messages_for_template(messages: List[dict]) -> List[dict]:

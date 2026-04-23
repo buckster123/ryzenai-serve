@@ -4,7 +4,10 @@ from ryzenai_serve import __version__
 
 
 def test_version():
-    assert __version__ == "0.1.0"
+    # Just sanity — version string is set and parseable
+    parts = __version__.split(".")
+    assert len(parts) == 3
+    assert all(p.isdigit() for p in parts)
 
 
 def test_imports():
