@@ -56,3 +56,40 @@ The entry point to look at is `onnxruntime_genai/models/builder.py`'s `Qwen2ForC
 ### How we'll know it's fixed
 
 Re-run `scripts/probe_all_models_oga.py` after any Ryzen AI SDK or `onnxruntime-genai` bump. When all 5 models output coherent sentences, remove this file.
+
+## Client disconnect does not abort in-flight generation
+
+**Status**: Known limitation, workaround available.
+**Severity**: Makes the server look "stuck" after an aborted long request — subsequent calls queue behind the zombie generation.
+
+### Symptom
+
+If a client aborts a `/v1/chat/completions` request mid-generation (network drop, `Ctrl+C` on curl, browser tab closed, script timeout), the server keeps decoding until `max_tokens` is exhausted. Because `NPUEngine` serializes generation with a per-engine `threading.Lock`, any concurrent request arrives to find the lock held and blocks. From the user's perspective, the server has hung.
+
+This is especially painful with Gemma-3-4b-it-mm (VLM) because text-only requests decode at ~8.7 t/s — a 400-token orphaned generation blocks the server for ~45 seconds.
+
+### Workaround
+
+- Set conservative `max_tokens` budgets on clients so orphaned generations clear quickly.
+- Use `repetition_penalty >= 1.1` so low-temperature sampling doesn't spin out to `max_tokens`.
+- Last resort: restart the server.
+
+### Proper fix
+
+Plumb the FastAPI `Request` object into `NPUEngine.stream()` and poll `await request.is_disconnected()` inside the token loop (or pass an `asyncio.Event`). On disconnect, break and release the lock. This requires making `stream()` async-aware; current code is sync-generator.
+
+## Small NPU models loop at low temperature without repetition penalty
+
+**Status**: Model behavior, exposed by default settings.
+**Severity**: Cosmetic — output reads as repetitive. Not broken, just annoying.
+
+### Symptom
+
+Gemma-3-4b-it on NPU at `temperature < 0.3` and `repetition_penalty = 1.0` (the server's default) can fall into repeating phrases or enumerations ("1. Apple\n2. Apple\n3. Apple..."), especially on long-form generation.
+
+### Fix / recommendation
+
+- Chat UI defaults `repetition_penalty` to `1.1` (see `static/chat.html`).
+- API callers should pass `"repetition_penalty": 1.1` for low-temp generations on small models.
+- The server accepts `repetition_penalty` as a top-level field in `ChatRequest`; it is NOT derived from OpenAI's `frequency_penalty` / `presence_penalty` (which ryzenai-serve does not map — they are scored per-token differently and the ORT-GenAI sampler only has one knob).
+

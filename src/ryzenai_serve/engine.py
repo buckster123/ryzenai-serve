@@ -251,6 +251,13 @@ class NPUEngine:
                 decode = self.tokenizer_stream.decode
 
             completion_tokens = 0
+            # For VLM models we allocate a fixed-size KV cache (max_sequence_length)
+            # regardless of the request's max_tokens, because the embedding ONNX is
+            # compiled for that exact length. But we still honor the caller's
+            # max_tokens by breaking the decode loop once that many tokens have
+            # been emitted. Without this, Gemma-3-4b runs to natural EOS or the
+            # 4K context limit even when the client asked for 80 tokens.
+            max_new = max(1, gc.max_tokens)
             try:
                 while not generator.is_done():
                     generator.generate_next_token()
@@ -259,6 +266,8 @@ class NPUEngine:
                     if piece:
                         yield piece
                     completion_tokens += 1
+                    if completion_tokens >= max_new:
+                        break
             finally:
                 self.stats.prompt_tokens += prompt_len
                 self.stats.completion_tokens += completion_tokens

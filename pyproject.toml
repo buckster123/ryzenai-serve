@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ryzenai-serve"
-version = "0.3.1"
+version = "0.3.2"
 description = "OpenAI-compatible HTTP server for AMD Ryzen AI NPU LLMs on Linux"
 readme = "README.md"
 authors = [{name = "Andre"}]
